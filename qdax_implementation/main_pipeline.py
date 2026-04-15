@@ -1,101 +1,266 @@
-import jax
-import jax.numpy as jnp
-import numpy as np
+"""
+main_pipeline.py
+================
+FD-ME-HT pipeline using the ACTUAL QDAX MAPElites class for the update loop.
+
+Key point:
+- We instantiate FDMEHTMAPElites, which subclasses QDAX MAPElites.
+- We override only init() in the subclass.
+- The iteration loop uses QDAX MAPElites.update() unchanged.
+"""
+
+from __future__ import annotations
+
 import os
+import functools
+import numpy as np
 import matplotlib.pyplot as plt
 
-# Import your custom modules
-from repertoire import DistributionalRepertoire, compute_cohens_d
-from ht_logic import calculate_ht_replacement
-from evaluator import evaluate_via_pytorch
+import jax
+import jax.numpy as jnp
+from jax import pure_callback, ShapeDtypeStruct
 
-# --- 1. SETTINGS & HYPERPARAMETERS ---
-GRID_SIZE = 5      # 5x5 Grid
-LATENT_DIM = 8     # Dimension of your noise/prompt vector
-NUM_RATERS = 5     # Number of VLM ratings per evaluation
-ITERATIONS = 20    # Number of candidates to test in this run
-IMG_RES = 64       # Resolution for the 'toy' image storage
+from qdax.core.containers.mapelites_repertoire import compute_euclidean_centroids
+from qdax.utils.metrics import default_qd_metrics
 
-# --- 2. CORE LOGIC ---
+from evaluator import evaluate_via_pytorch, extract_features
+from fdme_emitter import FDMEEmitter
+from fdme_map_elites import FDMEHTMAPElites
+from diversity_metrics import compute_behaviour_diversity, compute_pairwise_elite_distance
+from visuzalize_metrics import plot_experiment_heatmaps
 
-@jax.jit
-def get_grid_indices(bd_coordinates, num_bins=GRID_SIZE):
-    """Maps normalized BDs [0, 1] to Grid Indices [0, 4]."""
-    indices = jnp.floor(bd_coordinates * num_bins).astype(jnp.int32)
-    return jnp.clip(indices, 0, num_bins - 1)
 
-def update_step(repertoire, candidate_data):
-    """Process a single candidate and update the archive."""
-    gen, phen, scores, bd = candidate_data
-    idx = tuple(get_grid_indices(bd))
-    
-    # Check if cell is empty
-    is_empty = (repertoire.occupancy[idx] == 0)
-    
-    # Run Hypothesis Testing logic against current elite
-    # calculate_ht_replacement returns (should_replace, cles)
-    should_replace_ht, cles = calculate_ht_replacement(
-        scores, repertoire.scores[idx], alpha=0.05, delta_min=0.6
+# -------------------------------------------------------------------
+# Hyperparameters
+# -------------------------------------------------------------------
+GRID_SIZE = 5
+LATENT_DIM = 8
+NUM_RATERS = 5
+ITERATIONS = 100
+BATCH_SIZE = 4
+INIT_BATCH_SIZE = 8
+IMG_RES = 64
+SAMPLER_K = 5
+
+ALPHA = 0.05
+DELTA_MIN = 0.6
+MUTATION_PROB = 0.5
+MUTATION_SIGMA = 0.1
+SEED = 42
+
+#all algorithm inputs are above. 
+# -------------------------------------------------------------------
+# Descriptor callback: brightness + entropy
+# -------------------------------------------------------------------
+def _numpy_descriptor_batch(images_np: np.ndarray) -> np.ndarray:
+    from evaluator import BD_BRIGHTNESS_IDX, BD_ENTROPY_IDX
+    feats = np.stack([extract_features(img) for img in images_np], axis=0)  # (B, 5)
+    return feats[:, [BD_BRIGHTNESS_IDX, BD_ENTROPY_IDX]].astype(np.float32)  # brightness, entropy
+
+
+def descriptor_via_callback(images: jnp.ndarray) -> jnp.ndarray:
+    out_shape = ShapeDtypeStruct((images.shape[0], 2), jnp.float32)
+    return pure_callback(_numpy_descriptor_batch, out_shape, images)
+
+#extracts brightness and entropy from a batch of images using extract_features() from evaluator.py, which is a numpy function. We use pure_callback to safely call it from JAX code. The resulting descriptors are (B, 2) arrays of brightness and entropy for each image in the batch.
+# -------------------------------------------------------------------
+# JAX-native simulated sampler
+# -------------------------------------------------------------------
+def simulate_sampler_batch(genotypes: jnp.ndarray, key: jax.Array) -> jnp.ndarray:
+    """
+    JAX-friendly fake diffusion sampler.
+    Input: (B, D)
+    Output: (B, H, W, 3)
+    """
+    #takes a batch of genotypes (latent vectors), produces a batch of images. The mean of each genotype controls base brightness. K=5 rounds of decaying noise added on top. 
+    #This is the simulated diffusion sampler. in a real sustem this would be stable diffusion + GNSO guidance. 
+
+
+    batch_size = genotypes.shape[0]
+
+    base = jnp.clip(jnp.mean(genotypes, axis=1) * 0.5 + 0.5, 0.05, 0.95)
+    x = jnp.broadcast_to(base[:, None, None, None], (batch_size, IMG_RES, IMG_RES, 3))
+
+    keys = jax.random.split(key, SAMPLER_K)
+    for k in range(SAMPLER_K):
+        noise = jax.random.normal(keys[k], shape=x.shape, dtype=jnp.float32)
+        x = x + noise / (k + 2)
+
+    return jnp.clip(x, 0.0, 1.0)
+
+
+# -------------------------------------------------------------------
+# QDAX scoring function signature:
+#   (genotypes, key) -> (fitnesses, descriptors, extra_scores, key)
+# -------------------------------------------------------------------
+def scoring_function(genotypes: jnp.ndarray, key: jax.Array):
+    key_sampler, key_out = jax.random.split(key)
+
+    images = simulate_sampler_batch(genotypes, key_sampler)              # (B, H, W, 3)
+    descriptors = descriptor_via_callback(images)                        # (B, 2)
+    scores = evaluate_via_pytorch(images)                                # (B, M)
+
+    fitnesses = -jnp.mean(scores, axis=1)  # QDAX maximizes fitness
+
+    extra_scores = {
+        "scores": scores,
+    }
+
+    return fitnesses, descriptors, extra_scores
+
+
+# -------------------------------------------------------------------
+# Metrics
+# -------------------------------------------------------------------
+def compute_metrics(repertoire):
+    empty = repertoire.fitnesses == -jnp.inf
+    qd_score = float(jnp.sum(repertoire.fitnesses, where=~empty))
+    coverage = float(100.0 * jnp.mean((~empty).astype(jnp.float32)))
+    max_fitness = float(jnp.max(jnp.where(~empty, repertoire.fitnesses, -jnp.inf)))
+    return {
+        "qd_score": qd_score,
+        "coverage": coverage,
+        "max_fitness": max_fitness,
+    }
+
+
+# -------------------------------------------------------------------
+# Run one experiment
+# -------------------------------------------------------------------
+def run_pipeline(use_ht: bool, seed: int = SEED, iterations: int = ITERATIONS):
+    key = jax.random.key(seed)
+
+    # Initial population
+    key, subkey = jax.random.split(key)
+    init_genotypes = jax.random.normal(
+        subkey,
+        shape=(INIT_BATCH_SIZE, LATENT_DIM),
+        dtype=jnp.float32,
     )
-    
-    # Replacement logic: Replace if empty OR if it passes the HT test
-    do_replace = is_empty | should_replace_ht
-    
-    # Update the Repertoire (JAX PyTree update)
-    new_repertoire = repertoire._replace(
-        genotypes=repertoire.genotypes.at[idx].set(jnp.where(do_replace, gen, repertoire.genotypes[idx])),
-        phenotypes=repertoire.phenotypes.at[idx].set(jnp.where(do_replace, phen, repertoire.phenotypes[idx])),
-        scores=repertoire.scores.at[idx].set(jnp.where(do_replace, scores, repertoire.scores[idx])),
-        occupancy=repertoire.occupancy.at[idx].set(1),
-        # Metrics Logging for Tech Report
-        attempt_counts=repertoire.attempt_counts.at[idx].add(1),
-        acceptance_counts=repertoire.acceptance_counts.at[idx].add(do_replace.astype(int)),
-        sum_effect_sizes=repertoire.sum_effect_sizes.at[idx].add(jnp.where(do_replace, cles, 0.0))
+
+    # Centroids
+    centroids = compute_euclidean_centroids(
+        grid_shape=(GRID_SIZE, GRID_SIZE),
+        minval=0.0,
+        maxval=1.0,
     )
-    
-    return new_repertoire
 
-def save_elites_to_disk(repertoire, folder="results/elites"):
-    """Exports all stored images to the results folder."""
-    if not os.path.exists(folder):
-        os.makedirs(folder)
-    
-    indices = jnp.argwhere(repertoire.occupancy > 0)
-    print(f"\n--- Exporting {len(indices)} Elites ---")
-    
-    for idx in indices:
-        r, c = int(idx[0]), int(idx[1])
-        img_data = repertoire.phenotypes[r, c]
-        fname = f"{folder}/elite_R{r}_C{c}.png"
-        plt.imsave(fname, np.array(img_data))
-    
-    print(f"Done. Images saved in: {folder}")
+    # Emitter
+    emitter = FDMEEmitter(
+        batch_size=BATCH_SIZE,
+        latent_dim=LATENT_DIM,
+        mutation_prob=MUTATION_PROB,
+        mutation_sigma=MUTATION_SIGMA,
+    )
 
-# --- 3. MAIN EXECUTION ---
+    # Metrics fn
+    metrics_fn = compute_metrics
 
+    # ACTUAL MAPElites object
+    map_elites = FDMEHTMAPElites(
+        scoring_function=scoring_function,
+        emitter=emitter,
+        metrics_function=metrics_fn,
+        use_ht=use_ht,
+        alpha=ALPHA,
+        delta_min=DELTA_MIN,
+    )
+
+    # Init repertoire via our subclass
+    key, subkey = jax.random.split(key)
+    repertoire, emitter_state, key = map_elites.init(
+        init_genotypes,
+        centroids,
+        subkey,
+    )
+
+    qd_history = []
+    metrics_history = []
+
+    print(f"\n{'='*60}")
+    print(f"  FD-ME-HT with QDAX MAPElites.update() | use_ht={use_ht}")
+    print(f"{'='*60}")
+
+    for t in range(iterations):
+        repertoire, emitter_state, metrics = map_elites.update(
+            repertoire,
+            emitter_state,
+            key,
+        )
+
+        metrics_py = {k: float(v) for k, v in metrics.items()}
+        qd_history.append(metrics_py["qd_score"])
+        metrics_history.append(metrics_py)
+
+        if t % 20 == 0 or t == iterations - 1:
+            print(
+                f"iter {t:3d} | coverage {metrics_py['coverage']:.1f}% | "
+                f"QD {metrics_py['qd_score']:.4f} | max_fit {metrics_py['max_fitness']:.4f}"
+            )
+
+    return repertoire, qd_history, metrics_history
+
+
+# -------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------
 if __name__ == "__main__":
-    # Initialize the empty Distributional Repertoire
-    repertoire = DistributionalRepertoire.init(GRID_SIZE, LATENT_DIM, NUM_RATERS, IMG_RES)
-    
-    print(f"Starting QDAX Pipeline with {ITERATIONS} iterations...")
+    os.makedirs("results", exist_ok=True)
 
-    for t in range(ITERATIONS):
-        # A. Create a dummy candidate
-        # In the real experiment, this is your Diffusion Sampler output
-        candidate_gen = jnp.array(np.random.randn(LATENT_DIM))
-        candidate_phen = jnp.array(np.random.rand(IMG_RES, IMG_RES, 3)) 
-        candidate_bd = jnp.array([np.random.rand(), np.random.rand()]) # [Brightness, Entropy]
-        
-        # B. Get Multi-Rater scores via the PyTorch Bridge
-        # This calls the evaluate_via_pytorch function in evaluator.py
-        candidate_scores = evaluate_via_pytorch(jnp.expand_dims(candidate_phen, 0))[0]
-        
-        # C. Run the update step
-        candidate_data = (candidate_gen, candidate_phen, candidate_scores, candidate_bd)
-        repertoire = update_step(repertoire, candidate_data)
-        
-        if (t + 1) % 5 == 0:
-            print(f"  Iteration {t+1}: Current Occupancy = {int(jnp.sum(repertoire.occupancy))}")
+    rep_ht, qd_ht, metrics_ht = run_pipeline(use_ht=True, seed=SEED)
+    rep_naive, qd_naive, metrics_naive = run_pipeline(use_ht=False, seed=SEED)
 
-    # D. Finalize and Save
-    save_elites_to_disk(repertoire)
+    print("\n" + "=" * 60)
+    print("FINAL METRICS")
+    print("=" * 60)
+
+    for label, rep, qd_hist in [
+        ("HT", rep_ht, qd_ht),
+        ("Naive", rep_naive, qd_naive),
+    ]:
+        div = compute_behaviour_diversity(rep)
+        pdist = compute_pairwise_elite_distance(rep)
+        m = compute_metrics(rep)
+
+        print(f"\n[{label}]")
+        print(f"  QD Score:               {qd_hist[-1]:.4f}")
+        print(f"  Coverage:               {m['coverage']:.1f}%")
+        print(f"  Max Fitness:            {m['max_fitness']:.4f}")
+        print(f"  BD Spread:              {div['bd_spread']:.4f}")
+        print(f"  Pairwise Elite Dist:    {pdist:.4f}")
+
+        if label == "HT":
+            print(f"  Rejected (p-value):     {int(jnp.sum(rep.rejection_p_count))}")
+            print(f"  Rejected (effect size): {int(jnp.sum(rep.rejection_es_count))}")
+
+    # Plot 1: QD score curve
+    plt.figure(figsize=(9, 5))
+    plt.plot(qd_ht, label="FD-ME-HT (HT gate)", linewidth=2)
+    plt.plot(qd_naive, label="Naive baseline", linewidth=2, linestyle="--")
+    plt.xlabel("Iteration")
+    plt.ylabel("QD Score")
+    plt.title("QD Score vs Iteration")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("results/qd_curve_comparison.png", dpi=150)
+    plt.close()
+
+    # Plot 2: rejection breakdown
+    p_rej = int(jnp.sum(rep_ht.rejection_p_count))
+    es_rej = int(jnp.sum(rep_ht.rejection_es_count))
+
+    plt.figure(figsize=(6, 4))
+    plt.bar(
+        ["p-value fail", "effect size fail"],
+        [p_rej, es_rej],
+    )
+    plt.title("HT Rejection Breakdown")
+    plt.ylabel("Count")
+    plt.tight_layout()
+    plt.savefig("results/rejection_breakdown.png", dpi=150)
+    plt.close()
+
+    # Plot 3: heatmaps
+    plot_experiment_heatmaps(rep_ht, grid_size=GRID_SIZE)
+
+    print("\nSaved all results in results/")
