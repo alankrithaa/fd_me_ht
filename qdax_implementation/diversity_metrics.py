@@ -8,33 +8,33 @@ import numpy as np
 
 def _occupancy_mask(repertoire):
     """Boolean mask of occupied cells — QDax convention: empty = -inf."""
-    return np.array(repertoire.fitnesses > -jnp.inf)
+    return np.asarray(repertoire.fitnesses > -jnp.inf)
 
 
 def compute_behaviour_diversity(repertoire):
     """Coverage (%) and BD spread (mean distance from grid centre)."""
-    mask      = _occupancy_mask(repertoire)
-    active_bds = np.array(repertoire.descriptors)[mask]
-    if active_bds.shape[0] < 2:
-        return {"bd_spread": 0.0, "coverage": 0.0}
-    coverage  = float(np.mean(mask) * 100)
-    center    = np.array([0.5, 0.5])
+    mask = _occupancy_mask(repertoire)
+    active_bds = np.asarray(repertoire.descriptors)[mask]
+    coverage = float(np.mean(mask) * 100.0)
+    if active_bds.shape[0] == 0:
+        return {"bd_spread": 0.0, "coverage": coverage}
+    center = np.array([0.5, 0.5], dtype=np.float32)
     avg_spread = float(np.mean(np.linalg.norm(active_bds - center, axis=1)))
     return {"coverage": coverage, "bd_spread": avg_spread}
 
 
 def compute_pairwise_elite_distance(repertoire):
     """Mean pairwise Euclidean distance between occupied elite genotypes."""
-    mask          = _occupancy_mask(repertoire)
-    occupied_genos = np.array(repertoire.genotypes)[mask]
+    mask = _occupancy_mask(repertoire)
+    occupied_genos = np.asarray(repertoire.genotypes)[mask]
     n = occupied_genos.shape[0]
     if n < 2:
         return 0.0
-    sq_norms    = np.sum(occupied_genos**2, axis=1)
+    sq_norms = np.sum(occupied_genos**2, axis=1)
     dot_product = occupied_genos @ occupied_genos.T
-    dist_sq     = np.maximum(sq_norms[:,None] + sq_norms[None,:] - 2*dot_product, 0.0)
+    dist_sq = np.maximum(sq_norms[:, None] + sq_norms[None, :] - 2.0 * dot_product, 0.0)
     dist_matrix = np.sqrt(dist_sq + 1e-6)
-    return float(np.sum(dist_matrix) / (n*(n-1)))
+    return float(np.sum(dist_matrix) / (n * (n - 1)))
 
 
 def compute_pairwise_cohens_d(repertoire):
@@ -50,25 +50,29 @@ def compute_pairwise_cohens_d(repertoire):
         cell_labels: list of cell index strings
         mean_abs_d: scalar summary — mean |d| across all off-diagonal pairs
     """
-    mask         = _occupancy_mask(repertoire)
-    occupied_idx = np.where(mask)[0]
-    n_occ        = len(occupied_idx)
+    mask = _occupancy_mask(repertoire)
+    occupied_idx = np.flatnonzero(mask)
+    n_occ = occupied_idx.size
 
     if n_occ < 2:
-        return np.zeros((1,1)), ["c0"], 0.0
+        label = f"c{int(occupied_idx[0])}" if n_occ == 1 else "c0"
+        return np.zeros((max(n_occ, 1), max(n_occ, 1)), dtype=np.float32), [label], 0.0
 
-    scores = np.array(repertoire.scores)[occupied_idx]   # (n_occ, M)
-    means  = np.mean(scores, axis=1)
-    varis  = np.var(scores,  axis=1)
+    scores = np.asarray(repertoire.scores)[occupied_idx]   # (n_occ, M)
+    means = np.mean(scores, axis=1)
+    varis = np.var(scores, axis=1)
 
-    d_matrix = np.zeros((n_occ, n_occ))
-    for i in range(n_occ):
-        for j in range(n_occ):
-            if i != j:
-                pooled_std = np.sqrt((varis[i] + varis[j]) / 2.0 + 1e-10)
-                d_matrix[i,j] = (means[i] - means[j]) / pooled_std
+    mean_diff = means[:, None] - means[None, :]
+    pooled_std = np.sqrt((varis[:, None] + varis[None, :]) / 2.0 + 1e-10)
+    d_matrix = np.divide(
+        mean_diff,
+        pooled_std,
+        out=np.zeros_like(mean_diff, dtype=np.float32),
+        where=pooled_std > 0.0,
+    )
+    np.fill_diagonal(d_matrix, 0.0)
 
     cell_labels = [f"c{idx}" for idx in occupied_idx]
-    upper_tri   = d_matrix[np.triu_indices(n_occ, k=1)]
-    mean_abs_d  = float(np.mean(np.abs(upper_tri))) if len(upper_tri) > 0 else 0.0
+    upper_tri = d_matrix[np.triu_indices(n_occ, k=1)]
+    mean_abs_d = float(np.mean(np.abs(upper_tri))) if upper_tri.size else 0.0
     return d_matrix, cell_labels, mean_abs_d

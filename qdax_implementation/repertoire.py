@@ -74,16 +74,16 @@ class DistributionalRepertoire(MapElitesRepertoire):
         return self.extra_scores[self.REJ_ES_KEY]
 
     @property
-    def use_ht_flag(self) -> bool:
-        return bool(self.extra_scores[self.USE_HT_KEY])
+    def use_ht_flag(self) -> jnp.ndarray:
+        return self.extra_scores[self.USE_HT_KEY]
 
     @property
-    def alpha_value(self) -> float:
-        return float(self.extra_scores[self.ALPHA_KEY])
+    def alpha_value(self) -> jnp.ndarray:
+        return self.extra_scores[self.ALPHA_KEY]
 
     @property
-    def delta_min_value(self) -> float:
-        return float(self.extra_scores[self.DELTA_KEY])
+    def delta_min_value(self) -> jnp.ndarray:
+        return self.extra_scores[self.DELTA_KEY]
 
     @classmethod #all from QDAX
     def init(
@@ -128,7 +128,8 @@ class DistributionalRepertoire(MapElitesRepertoire):
             descriptors=default_descriptors,
             centroids=centroids,
             extra_scores=default_extra_scores,
-            keys_extra_scores=cls.ALL_EXTRA_KEYS,
+            # Keep string metadata out of JAX-carried state.
+            keys_extra_scores=(),
         )
 
         return repertoire.add(
@@ -173,7 +174,8 @@ class DistributionalRepertoire(MapElitesRepertoire):
                 cls.ALPHA_KEY: jnp.array(alpha, dtype=jnp.float32),
                 cls.DELTA_KEY: jnp.array(delta_min, dtype=jnp.float32),
             },
-            keys_extra_scores=cls.ALL_EXTRA_KEYS,
+            # Keep string metadata out of JAX-carried state.
+            keys_extra_scores=(),
         )
 
     def add(
@@ -204,7 +206,6 @@ class DistributionalRepertoire(MapElitesRepertoire):
 
         batch_of_indices = get_cells_indices(batch_of_descriptors, self.centroids)
         num_centroids = self.centroids.shape[0]
-        batch_size = batch_of_genotypes.shape[0]
 
         best_fitness_in_batch = jax.ops.segment_max(
             batch_of_fitnesses,
@@ -212,65 +213,70 @@ class DistributionalRepertoire(MapElitesRepertoire):
             num_segments=num_centroids,
         )
 
-        candidate_is_batch_best = (
-            batch_of_fitnesses == best_fitness_in_batch[batch_of_indices]
-        )
+        candidate_is_batch_best = batch_of_fitnesses == best_fitness_in_batch[batch_of_indices]
 
-        repertoire = self
+        def _update_candidate(repertoire, inputs):
+            is_best, c, u_new, bd_new, f_new, S_new = inputs
+            if not bool(is_best):
+                return repertoire, None
 
-        for b in range(batch_size):
-            if not bool(candidate_is_batch_best[b]):
-                continue
-
-            c = int(batch_of_indices[b])
-            u_new = batch_of_genotypes[b]
-            bd_new = batch_of_descriptors[b]
-            f_new = batch_of_fitnesses[b]
-            S_new = batch_of_scores[b]
-
-            new_att = repertoire.extra_scores[self.ATT_KEY].at[c].add(1)
+            c_idx = jnp.asarray(c, dtype=jnp.int32)
+            new_att = repertoire.extra_scores[self.ATT_KEY].at[c_idx].add(1)
             repertoire = repertoire.replace(
                 extra_scores={**repertoire.extra_scores, self.ATT_KEY: new_att}
             )
 
-            is_empty = bool(repertoire.fitnesses[c] == -jnp.inf)
+            if bool(repertoire.fitnesses[c_idx] == -jnp.inf):
+                return repertoire._insert(c_idx, u_new, bd_new, f_new, S_new), None
 
-            if is_empty:
-                repertoire = repertoire._insert(c, u_new, bd_new, f_new, S_new)
-            else:
-                S_old = repertoire.scores[c]
+            S_old = repertoire.scores[c_idx]
 
-                if use_ht:
-                    should_replace, p_val, cles = calculate_ht_replacement(
-                        S_new, S_old, alpha=alpha, delta_min=delta_min
-                    )
-                    p_val_f = float(p_val)
-                    cles_f = float(cles)
+            if bool(use_ht):
+                should_replace, p_val, cles = calculate_ht_replacement(
+                    S_new, S_old, alpha=alpha, delta_min=delta_min
+                )
+                should_replace_b = bool(should_replace)
+                p_reject = int((not should_replace_b) and bool(p_val >= alpha))
+                es_reject = int(
+                    (not should_replace_b)
+                    and bool(p_val < alpha)
+                    and bool(cles <= delta_min)
+                )
 
-                    # Rejection tracking: mutually exclusive failure modes
-                    # p_reject: statistical significance failed (p >= alpha)
-                    # es_reject: significance passed (p < alpha) but effect size failed (cles <= delta_min)
-                    is_p_reject = (not bool(should_replace)) and (p_val_f >= alpha)
-                    is_es_reject = (not bool(should_replace)) and (p_val_f < alpha) and (cles_f <= delta_min)
+                new_rp = repertoire.extra_scores[self.REJ_P_KEY].at[c_idx].add(p_reject)
+                new_res = repertoire.extra_scores[self.REJ_ES_KEY].at[c_idx].add(es_reject)
+                repertoire = repertoire.replace(
+                    extra_scores={
+                        **repertoire.extra_scores,
+                        self.REJ_P_KEY: new_rp,
+                        self.REJ_ES_KEY: new_res,
+                    }
+                )
 
-                    new_rp = repertoire.extra_scores[self.REJ_P_KEY].at[c].add(int(is_p_reject))
-                    new_res = repertoire.extra_scores[self.REJ_ES_KEY].at[c].add(int(is_es_reject))
-                    repertoire = repertoire.replace(
-                        extra_scores={
-                            **repertoire.extra_scores,
-                            self.REJ_P_KEY: new_rp,
-                            self.REJ_ES_KEY: new_res,
-                        }
-                    )
-                else:
-                    should_replace = bool(jnp.mean(S_new) < jnp.mean(S_old))
-                    cles_f = 1.0
+                if should_replace_b:
+                    return repertoire._insert(c_idx, u_new, bd_new, f_new, S_new, cles=cles), None
+                return repertoire, None
 
-                if bool(should_replace):
-                    repertoire = repertoire._insert(
-                        c, u_new, bd_new, f_new, S_new, cles=cles_f
-                    )
+            should_replace = bool(jnp.mean(S_new) < jnp.mean(S_old))
+            if should_replace:
+                cles = jnp.asarray(1.0, dtype=repertoire.extra_scores[self.ES_KEY].dtype)
+                return repertoire._insert(c_idx, u_new, bd_new, f_new, S_new, cles=cles), None
 
+            return repertoire, None
+
+        batch_inputs = (
+            candidate_is_batch_best,
+            batch_of_indices,
+            batch_of_genotypes,
+            batch_of_descriptors,
+            batch_of_fitnesses,
+            batch_of_scores,
+        )
+        repertoire = self
+        batch_size = int(batch_of_genotypes.shape[0])
+        for i in range(batch_size):
+            inputs_i = tuple(x[i] for x in batch_inputs)
+            repertoire, _ = _update_candidate(repertoire, inputs_i)
         return repertoire
 
     def _insert(

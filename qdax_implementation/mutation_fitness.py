@@ -22,57 +22,10 @@ import matplotlib.patches as mpatches
 
 from repertoire import DistributionalRepertoire
 from evaluator import evaluate_via_pytorch, extract_features
+from diversity_metrics import compute_pairwise_cohens_d
 from main_pipeline import run_pipeline   # reuse the full pipeline
 
 os.makedirs("results", exist_ok=True)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# COHEN'S D FUNCTION  — add this to diversity_metrics.py
-# ─────────────────────────────────────────────────────────────────────────────
-
-def compute_pairwise_cohens_d(repertoire):
-    """
-    Compute pairwise Cohen's d between all occupied cells.
-
-    For each pair of cells (A, B) with score distributions S_A and S_B:
-        d_AB = (mean_A - mean_B) / sqrt((var_A + var_B) / 2)
-
-    Interpretation:
-        |d| < 0.2  = negligible difference
-        |d| ~ 0.5  = medium effect
-        |d| > 0.8  = large effect — cells are genuinely different in quality
-
-    Returns:
-        d_matrix: (N_occ, N_occ) array of Cohen's d values
-        cell_labels: list of cell index strings for axis labels
-        mean_abs_d: scalar — mean |d| across all pairs (summary statistic)
-    """
-    mask = np.array(repertoire.fitnesses > -jnp.inf)   # (num_centroids,)
-    occupied_idx = np.where(mask)[0]
-    n_occ = len(occupied_idx)
-
-    if n_occ < 2:
-        return np.zeros((1,1)), ["c0"], 0.0
-
-    # Scores for occupied cells: shape (n_occ, M)
-    scores = np.array(repertoire.scores)[occupied_idx]   # (n_occ, M)
-    means  = np.mean(scores, axis=1)                     # (n_occ,)
-    varis  = np.var(scores,  axis=1)                     # (n_occ,)
-
-    # Build (n_occ x n_occ) Cohen's d matrix
-    d_matrix = np.zeros((n_occ, n_occ))
-    for i in range(n_occ):
-        for j in range(n_occ):
-            if i == j:
-                d_matrix[i, j] = 0.0
-                continue
-            pooled_std = np.sqrt((varis[i] + varis[j]) / 2.0 + 1e-10)
-            d_matrix[i, j] = (means[i] - means[j]) / pooled_std
-
-    cell_labels = [f"c{idx}" for idx in occupied_idx]
-    mean_abs_d  = float(np.mean(np.abs(d_matrix[np.triu_indices(n_occ, k=1)])))
-    return d_matrix, cell_labels, mean_abs_d
 
 
 # ─────────────────────────────────────────────────────────────────────────────

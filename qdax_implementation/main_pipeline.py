@@ -23,11 +23,16 @@ from jax import pure_callback, ShapeDtypeStruct
 from qdax.core.containers.mapelites_repertoire import compute_euclidean_centroids
 from qdax.utils.metrics import default_qd_metrics
 
-from evaluator import evaluate_via_pytorch, extract_features
+from evaluator import (
+    BD_BRIGHTNESS_IDX,
+    BD_ENTROPY_IDX,
+    evaluate_via_pytorch,
+    extract_features,
+)
 from fdme_emitter import FDMEEmitter
 from fdme_map_elites import FDMEHTMAPElites
 from diversity_metrics import compute_behaviour_diversity, compute_pairwise_elite_distance
-from visuzalize_metrics import plot_experiment_heatmaps
+from visualize_metrics import plot_experiment_heatmaps
 
 
 # -------------------------------------------------------------------
@@ -53,7 +58,6 @@ SEED = 42
 # Descriptor callback: brightness + entropy
 # -------------------------------------------------------------------
 def _numpy_descriptor_batch(images_np: np.ndarray) -> np.ndarray:
-    from evaluator import BD_BRIGHTNESS_IDX, BD_ENTROPY_IDX
     feats = np.stack([extract_features(img) for img in images_np], axis=0)  # (B, 5)
     return feats[:, [BD_BRIGHTNESS_IDX, BD_ENTROPY_IDX]].astype(np.float32)  # brightness, entropy
 
