@@ -69,7 +69,9 @@ class DROMEMAPElites:
         # 2. A2 Judge Update (Intermittent Pull)
         def _do_refine(carry):
             _a2, _a1 = carry
-            return _a2.add(_a1.genotypes, _a1.descriptors, _a1.fitnesses, {"scores": _a1.scores}), _a1
+            # Only push occupied cells from A1 to A2 via an active mask
+            active_mask = ( _a1.fitnesses > -jnp.inf ).astype(jnp.int32)
+            return _a2.add(_a1.genotypes, _a1.descriptors, _a1.fitnesses, {"scores": _a1.scores, "active_mask": active_mask}), _a1
 
         a2, _ = jax.lax.cond(
             (iteration % self._refine_freq == 0) & (iteration > 0),

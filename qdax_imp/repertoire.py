@@ -78,13 +78,14 @@ class DistributionalRepertoire(MapElitesRepertoire):
         batch_of_indices = get_cells_indices(batch_of_descriptors, self.centroids)
 
         def scan_body(rep, inputs):
-            u_new, bd_new, f_new, S_new, c_idx = inputs
+            u_new, bd_new, f_new, S_new, c_idx, active = inputs
             c = jnp.asarray(c_idx, dtype=jnp.int32)
             
             # Record Attempt
+            # only count attempts for active entries (default active==1)
             rep = rep.replace(extra_scores={
                 **rep.extra_scores,
-                self.ATT_KEY: rep.extra_scores[self.ATT_KEY].at[c].add(1)
+                self.ATT_KEY: rep.extra_scores[self.ATT_KEY].at[c].add(active.astype(jnp.int32))
             })
 
             # Gate Logic
@@ -102,16 +103,37 @@ class DistributionalRepertoire(MapElitesRepertoire):
             
             # Always allow if cell was empty
             cond = jnp.where(rep.fitnesses[c] == -jnp.inf, True, cond)
+            accept = cond
+            use_ht = rep.extra_scores[self.USE_HT_KEY]
+            is_empty = rep.fitnesses[c] == -jnp.inf
+
+            # Track rejections when HT is enabled and cell occupied
+            was_rejected = (~accept) & use_ht & (~is_empty) & (active.astype(bool))
+            is_p_reject = was_rejected & (p_val >= rep.extra_scores[self.ALPHA_KEY])
+            is_es_reject = was_rejected & (cles <= rep.extra_scores[self.DELTA_KEY])
 
             def _perform_insert(_rep):
                 return _rep._insert(c, u_new, bd_new, f_new, S_new, jnp.where(cond, cles, 1.0))
 
+            # Update rejection counters (adds 1 where true, 0 where false)
+            rep = rep.replace(extra_scores={
+                **rep.extra_scores,
+                self.REJ_P_KEY: rep.extra_scores[self.REJ_P_KEY].at[c].add(is_p_reject.astype(jnp.int32)),
+                self.REJ_ES_KEY: rep.extra_scores[self.REJ_ES_KEY].at[c].add(is_es_reject.astype(jnp.int32)),
+            })
+
             return jax.lax.cond(cond, _perform_insert, lambda x: x, rep), None
+
+        # prepare active mask for inputs (default: all ones)
+        batch_of_active = batch_of_extra_scores.get(
+            "active_mask",
+            jnp.ones((batch_of_genotypes.shape[0],), dtype=jnp.int32)
+        )
 
         final_rep, _ = jax.lax.scan(
             scan_body, 
             self, 
-            (batch_of_genotypes, batch_of_descriptors, batch_of_fitnesses, batch_of_scores, batch_of_indices)
+            (batch_of_genotypes, batch_of_descriptors, batch_of_fitnesses, batch_of_scores, batch_of_indices, batch_of_active)
         )
         return final_rep
 

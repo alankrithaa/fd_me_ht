@@ -9,6 +9,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import Tuple
+import jax
+import jax.numpy as jnp
+from scipy import stats
+from typing import Sequence
 
 def compute_cohens_d(scores_A: np.ndarray, scores_B: np.ndarray) -> float:
     """
@@ -147,6 +151,101 @@ def analyze_cohens_d_distribution(
     }
     
     return results
+
+
+def evaluate_ground_truth_qd(repertoire, scoring_function, key, m_test: int = 10):
+    """
+    For a single repertoire, re-evaluate each occupied cell `m_test` times
+    (each run uses `scoring_function(genotypes, key)` with independent keys),
+    aggregate all scores and compute ground-truth fitness per cell and GT QD.
+
+    Returns: gt_qd (float), apparent_fitnesses (np.array), gt_fitnesses (np.array), occupied_indices (np.array)
+    """
+    # Occupied cells
+    occ_mask = repertoire.fitnesses > -jnp.inf
+    occ_idx = jnp.where(occ_mask)[0]
+    if occ_idx.size == 0:
+        return 0.0, np.array([]), np.array([]), np.array([])
+
+    genotypes_occ = repertoire.genotypes[occ_idx]
+
+    keys = jax.random.split(key, m_test)
+
+    def eval_with_key(k):
+        f, d, extras = scoring_function(genotypes_occ, k)
+        return extras["scores"]  # (num_occ, M)
+
+    # scores_all: (m_test, num_occ, M)
+    scores_all = jax.vmap(eval_with_key)(keys)
+
+    # transpose -> (num_occ, m_test, M) then reshape to (num_occ, m_test*M)
+    scores_per_cell = jnp.reshape(jnp.transpose(scores_all, (1, 0, 2)), (genotypes_occ.shape[0], -1))
+
+    gt_fitnesses = -jnp.mean(scores_per_cell, axis=1)
+    gt_qd = jnp.sum(gt_fitnesses)
+
+    apparent = repertoire.fitnesses[occ_idx]
+
+    return float(gt_qd), np.array(apparent), np.array(gt_fitnesses), np.array(occ_idx)
+
+
+def paired_ttest_bootstrap(diffs: Sequence[float], n_boot: int = 1000, seed: int = 0):
+    diffs = np.array(diffs)
+    t_stat, p_val = stats.ttest_1samp(diffs, 0.0)
+    rng = np.random.RandomState(seed)
+    boot_means = [np.mean(rng.choice(diffs, size=len(diffs), replace=True)) for _ in range(n_boot)]
+    ci_low, ci_high = np.percentile(boot_means, [2.5, 97.5])
+    return float(t_stat), float(p_val), float(ci_low), float(ci_high)
+
+
+def evaluate_archives_across_seeds(a1_list, a2_list, scoring_function, m_test: int = 10):
+    """
+    For lists of A1 and A2 repertoires (one per seed), compute apparent vs GT QD,
+    inflation gaps, paired t-test on GT QD differences and bootstrap CI.
+    Prints a concise summary and returns a dict of results.
+    """
+    gt_qd_a1, app_qd_a1 = [], []
+    gt_qd_a2, app_qd_a2 = [], []
+
+    for i, (r1, r2) in enumerate(zip(a1_list, a2_list)):
+        key1 = jax.random.PRNGKey(10000 + i)
+        key2 = jax.random.PRNGKey(20000 + i)
+        gq1, app1, gt1, _ = evaluate_ground_truth_qd(r1, scoring_function, key1, m_test)
+        gq2, app2, gt2, _ = evaluate_ground_truth_qd(r2, scoring_function, key2, m_test)
+        gt_qd_a1.append(gq1)
+        gt_qd_a2.append(gq2)
+        app_qd_a1.append(float(jnp.sum(r1.fitnesses[r1.fitnesses > -jnp.inf])))
+        app_qd_a2.append(float(jnp.sum(r2.fitnesses[r2.fitnesses > -jnp.inf])))
+
+    gt_qd_a1 = np.array(gt_qd_a1)
+    gt_qd_a2 = np.array(gt_qd_a2)
+    app_qd_a1 = np.array(app_qd_a1)
+    app_qd_a2 = np.array(app_qd_a2)
+
+    inflation_a1 = app_qd_a1 - gt_qd_a1
+    inflation_a2 = app_qd_a2 - gt_qd_a2
+
+    diffs = gt_qd_a2 - gt_qd_a1
+    t_stat, p_val, ci_low, ci_high = paired_ttest_bootstrap(diffs)
+
+    print("\nGround-truth vs apparent QD summary:")
+    print(f"  A1 apparent mean QD: {app_qd_a1.mean():+.4f} | GT mean QD: {gt_qd_a1.mean():+.4f} | inflation: {inflation_a1.mean():+.4f}")
+    print(f"  A2 apparent mean QD: {app_qd_a2.mean():+.4f} | GT mean QD: {gt_qd_a2.mean():+.4f} | inflation: {inflation_a2.mean():+.4f}")
+    print(f"\nPaired test on GT QD differences (A2 - A1): t={t_stat:.4f}, p={p_val:.4f}")
+    print(f"Bootstrap 95% CI of mean diff: [{ci_low:+.4f}, {ci_high:+.4f}]")
+
+    return {
+        "gt_qd_a1": gt_qd_a1,
+        "gt_qd_a2": gt_qd_a2,
+        "app_qd_a1": app_qd_a1,
+        "app_qd_a2": app_qd_a2,
+        "inflation_a1": inflation_a1,
+        "inflation_a2": inflation_a2,
+        "t_stat": t_stat,
+        "p_val": p_val,
+        "ci_low": ci_low,
+        "ci_high": ci_high,
+    }
 
 
 if __name__ == "__main__":

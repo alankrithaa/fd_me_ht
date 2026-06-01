@@ -11,6 +11,7 @@ from evaluator import evaluate_via_pytorch, extract_features, BD_BRIGHTNESS_IDX,
 from fdme_emitter import FDMEEmitter
 from fdme_map_elites import DROMEMAPElites
 from repertoire import DistributionalRepertoire
+from cohens_d import evaluate_archives_across_seeds
 
 # --- Config ---
 N_SEEDS         = 15
@@ -75,11 +76,14 @@ if __name__ == "__main__":
     qds_a1, qds_a2 = [], []
     cov_a1, cov_a2 = [], []
     max_fits = []
+    rep_a1_list, rep_a2_list = [], []
     
     total_att, total_rej_p, total_rej_es = 0, 0, 0
 
     for s in range(N_SEEDS):
         a1, a2, m = run_one_seed(s)
+        rep_a1_list.append(a1)
+        rep_a2_list.append(a2)
         
         qds_a1.append(m['a1']['qd'])
         qds_a2.append(m['a2']['qd'])
@@ -124,3 +128,6 @@ if __name__ == "__main__":
     print(f"    Rejected (ES fail): {total_rej_es}")
     print(f"    Acceptance Rate:    {((total_att - total_rej_p - total_rej_es)/max(1, total_att))*100:.1f}%")
     print("="*65)
+    # Ground-truth evaluation across seeds (re-score elites)
+    print("\nEvaluating ground-truth QD by re-scoring elites (m_test=10)...")
+    evaluate_archives_across_seeds(rep_a1_list, rep_a2_list, scoring_function, m_test=10)

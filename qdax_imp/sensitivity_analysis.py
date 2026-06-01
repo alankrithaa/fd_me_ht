@@ -25,6 +25,7 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 
 from repertoire import DistributionalRepertoire
+from qdax.core.containers.mapelites_repertoire import compute_euclidean_centroids
 from evaluator import evaluate_via_pytorch, extract_features, VLM_WEIGHTS, NUM_VLMS, NOISE_SIGMA
 from ht_logic import calculate_ht_replacement
 from diversity_metrics import compute_behaviour_diversity
@@ -105,9 +106,9 @@ def compute_qd(repertoire):
     return float(jnp.sum(repertoire.fitnesses, where=~empty))
 
 def compute_rejection_rate(repertoire):
-    total_att = int(jnp.sum(repertoire.attempt_counts))
-    total_rej = int(jnp.sum(repertoire.rejection_p_count)) + \
-                int(jnp.sum(repertoire.rejection_es_count))
+    total_att = int(jnp.sum(repertoire.extra_scores[DistributionalRepertoire.ATT_KEY]))
+    total_rej = int(jnp.sum(repertoire.extra_scores[DistributionalRepertoire.REJ_P_KEY])) + \
+                int(jnp.sum(repertoire.extra_scores[DistributionalRepertoire.REJ_ES_KEY]))
     if total_att == 0:
         return 0.0
     return total_rej / total_att
@@ -115,11 +116,20 @@ def compute_rejection_rate(repertoire):
 def run_one(num_raters=5, delta_min=0.6, seed=SEED):
     """Run one full pipeline and return final QD + rejection rate."""
     rng = np.random.RandomState(seed)
-    repertoire = DistributionalRepertoire.init_empty(
-        grid_shape=(GRID_SIZE, GRID_SIZE),
-        latent_dim=LATENT_DIM,
-        num_raters=num_raters,
-        img_res=IMG_RES,
+    # Initialize centroids and an initial small population
+    centroids = compute_euclidean_centroids((GRID_SIZE, GRID_SIZE), 0, 1)
+    init_genotypes = rng.randn(INIT_BATCH_SIZE, LATENT_DIM).astype(np.float32)
+    # Score initial genotypes to obtain fitnesses/descriptors/extras
+    fits, descs, extras = score_batch(init_genotypes, rng, num_raters)
+    repertoire = DistributionalRepertoire.init(
+        genotypes=jnp.array(init_genotypes),
+        fitnesses=fits,
+        descriptors=descs,
+        centroids=centroids,
+        extra_scores=extras,
+        use_ht=True,
+        alpha=ALPHA,
+        delta_min=delta_min,
     )
     for t in range(ITERATIONS):
         batch_g = ask_emitter(repertoire, rng, BATCH_SIZE)
